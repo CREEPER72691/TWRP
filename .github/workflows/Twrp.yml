@@ -1,0 +1,198 @@
+# GitHub Actions workflow: Build TWRP for OnePlus Nord N10 5G (billie)
+# Notes:
+# - Android builds are large: use a self-hosted runner with >= 100 GB free disk, lots of RAM/CPU.
+# - Set manifest_branch to the Lineage/Android branch you want (e.g., lineage-18.1 for Android 11).
+# - Provide kernel_repo and vendor_repo if you have prebuilt kernel/vendor trees to inject.
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_url:
+        description: 'repo manifest URL (xml) for AOSP/Lineage/TWRP'
+        required: true
+        default: 'https://github.com/LineageOS/android.git'
+      manifest_branch:
+        description: 'manifest branch (e.g., lineage-18.1 for Android 11)'
+        required: true
+        default: 'lineage-18.1'
+      device_repo:
+        description: 'Device tree repo (TWRP-capable). Default points at a community TWRP device tree for billie'
+        required: true
+        default: 'https://github.com/EduardoA3677/device_oneplus_billie_twrp.git'
+      device_path:
+        description: 'Path to place the device tree inside the source tree'
+        required: true
+        default: 'device/oneplus/billie'
+      kernel_repo:
+        description: 'Optional kernel source repo (clone into kernel/*). Leave empty to use manifest-provided kernel'
+        required: false
+        default: 'https://github.com/OnePlusOSS/android_kernel_oneplus_sm6350.git'
+      vendor_repo:
+        description: 'Optional vendor/proprietary tree or prebuilt vendor repo'
+        required: false
+        default: ''
+      lunch_target:
+        description: 'lunch target (e.g., lineage_billie-userdebug)'
+        required: true
+        default: 'lineage_billie-userdebug'
+      java_version:
+        description: 'JDK version to use'
+        required: false
+        default: '11'
+      jobs:
+        description: 'parallel jobs for repo sync and make (example: 8)'
+        required: false
+        default: '4'
+
+jobs:
+  build:
+    name: Build TWRP (billie)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - name: Checkout workflow repo (scripts if any)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install apt packages
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            openjdk-11-jdk python3 python3-pip unzip bc rsync ccache wget \
+            libncurses5 libncurses5-dev libssl-dev
+        shell: bash
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+
+      - name: Install repo tool
+        run: |
+          mkdir -p ~/bin
+          curl -sSfLo ~/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Configure ccache
+        run: |
+          mkdir -p $CCACHE_DIR
+          export CCACHE_DIR=$CCACHE_DIR
+          ccache -M 50G || true
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ inputs.manifest_branch }}-${{ hashFiles('**/.repo/manifest.xml') }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ inputs.manifest_branch }}-
+
+      - name: Initialize repo manifest
+        run: |
+          set -euo pipefail
+          repo init -u "${{ inputs.manifest_url }}" -b "${{ inputs.manifest_branch }}" --depth=1 || \
+            repo init -u "${{ inputs.manifest_url }}" -b "${{ inputs.manifest_branch }}"
+        shell: bash
+
+      - name: Repo sync (sources)
+        run: |
+          set -euo pipefail
+          repo sync -c -j${{ inputs.jobs }} --no-clone-bundle --no-tags
+        shell: bash
+
+      - name: Inject device tree (TWRP device tree for billie)
+        run: |
+          set -euo pipefail
+          echo "Cloning device tree ${INPUTS_DEVICE_REPO:-${{ inputs.device_repo }}} -> ${{ inputs.device_path }}"
+          git clone --depth=1 "${{ inputs.device_repo }}" "${{ inputs.device_path }}"
+        env:
+          INPUTS_DEVICE_REPO: ${{ inputs.device_repo }}
+        shell: bash
+
+      - name: Inject kernel source (optional)
+        if: ${{ inputs.kernel_repo != '' }}
+        run: |
+          set -euo pipefail
+          KDIR=kernel/oneplus/sm6350
+          echo "Cloning kernel into $KDIR"
+          mkdir -p "$(dirname "$KDIR")"
+          git clone --depth=1 "${{ inputs.kernel_repo }}" "$KDIR"
+        shell: bash
+
+      - name: Inject vendor tree (optional)
+        if: ${{ inputs.vendor_repo != '' }}
+        run: |
+          set -euo pipefail
+          echo "Cloning vendor repo into vendor/"
+          git clone --depth=1 "${{ inputs.vendor_repo }}" vendor/prebuiltvendor || true
+        shell: bash
+
+      - name: Show top-level layout (debug)
+        run: |
+          echo "Top-level dirs:"
+          ls -la
+          echo "Device tree (listing):"
+          ls -la "${{ inputs.device_path }}" || true
+        shell: bash
+
+      - name: Prepare build environment
+        run: |
+          set -euo pipefail
+          source build/envsetup.sh
+          # Use breakfast if available for Omni/Lineage + TWRP combos; otherwise use lunch
+          if type breakfast >/dev/null 2>&1; then
+            echo "Using breakfast ${{ inputs.lunch_target }}"
+            breakfast "${{ inputs.lunch_target }}" || true
+          else
+            echo "Using lunch ${{ inputs.lunch_target }}"
+            lunch "${{ inputs.lunch_target }}" || true
+          fi
+        shell: bash
+
+      - name: Build recovery image (TWRP)
+        run: |
+          set -euo pipefail
+          JOBS=${{ inputs.jobs }}
+          if [ -z "$JOBS" ] || [ "$JOBS" -le 0 ]; then
+            JOBS=$(nproc)
+          fi
+          echo "Building recovery with -j$JOBS"
+          export USE_CCACHE=1
+          # Try common targets in order
+          if make -n recoveryimage >/dev/null 2>&1; then
+            mka recoveryimage -j"$JOBS"
+          elif make -n twrp_recoveryimage >/dev/null 2>&1; then
+            mka twrp_recoveryimage -j"$JOBS"
+          else
+            mka recovery -j"$JOBS"
+          fi
+        env:
+          CCACHE_DIR: ${{ env.CCACHE_DIR }}
+        shell: bash
+
+      - name: Find built image and upload artifact
+        id: findimg
+        run: |
+          set -euo pipefail
+          OUT_DIR=out/target/product
+          echo "Searching for recovery image under $OUT_DIR"
+          RECOV=$(find $OUT_DIR -type f \( -name "recovery.img" -o -name "twrp.img" -o -name "recovery.img.gz" -o -name "twrp_*.img" \) -print -quit || true)
+          if [ -z "$RECOV" ]; then
+            echo "No recovery image found. Listing out/target/product for debugging:"
+            ls -la $OUT_DIR || true
+            exit 1
+          fi
+          echo "Found recovery image: $RECOV"
+          echo "::set-output name=image::$RECOV"
+        shell: bash
+
+      - name: Upload recovery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-image-billie
+          path: ${{ steps.findimg.outputs.image }}
